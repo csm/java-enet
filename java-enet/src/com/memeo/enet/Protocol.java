@@ -78,7 +78,7 @@ final class Protocol
 			this.buffer = buffer.order(ByteOrder.BIG_ENDIAN);
 		}
 		
-		int length()
+		static int length()
 		{
 			return 4;
 		}
@@ -113,7 +113,7 @@ final class Protocol
 			this.buffer = buffer.order(ByteOrder.BIG_ENDIAN);
 		}
 		
-		int length()
+		static int length()
 		{
 			return 4;
 		}
@@ -156,7 +156,12 @@ final class Protocol
 		public Acknowledge(ByteBuffer buffer)
 		{
 			super(buffer);
-			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(super.length())).slice();
+			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(CommandHeader.length())).slice();
+		}
+		
+		static int length()
+		{
+		    return CommandHeader.length() + 4;
 		}
 
 		int receivedReliableSequenceNumber()
@@ -187,12 +192,12 @@ final class Protocol
 		Connect(ByteBuffer buffer)
 		{
 			super(buffer);
-			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(super.length())).slice();
+			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(VerifyConnect.length())).slice();
 		}
 		
-		int length()
+		static int length()
 		{
-			return super.length() + 4;
+			return VerifyConnect.length() + 4;
 		}
 		
 		int data()
@@ -213,12 +218,12 @@ final class Protocol
 		VerifyConnect(ByteBuffer buffer)
 		{
 			super(buffer);
-			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(super.length())).slice();
+			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(CommandHeader.length())).slice();
 		}
 
-		int length()
+		static int length()
 		{
-			return super.length() + 40;
+			return CommandHeader.length() + 40;
 		}
 		
 		int outgoingPeerID()
@@ -349,12 +354,12 @@ final class Protocol
 		BandwidthLimit(ByteBuffer buffer)
 		{
 			super(buffer);
-			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(super.length())).slice();
+			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(CommandHeader.length())).slice();
 		}
 		
-		int length()
+		static int length()
 		{
-			return super.length() + 8;
+			return CommandHeader.length() + 8;
 		}
 
 		int incomingBandwidth()
@@ -385,12 +390,12 @@ final class Protocol
 		ThrottleConfigure(ByteBuffer buffer)
 		{
 			super(buffer);
-			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(super.length())).slice();
+			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(CommandHeader.length())).slice();
 		}
 
-		int length()
+		static int length()
 		{
-			return super.length() + 12;
+			return CommandHeader.length() + 12;
 		}
 		
 		int packetThrottleInterval()
@@ -431,12 +436,12 @@ final class Protocol
 		Disconnect(ByteBuffer buffer)
 		{
 			super(buffer);
-			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(super.length())).slice();
+			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(CommandHeader.length())).slice();
 		}
 
-		int length()
+		static int length()
 		{
-			return super.length() + 4;
+			return CommandHeader.length() + 4;
 		}
 		
 		int data()
@@ -465,12 +470,12 @@ final class Protocol
 		SendReliable(ByteBuffer buffer)
 		{
 			super(buffer);
-			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(super.length())).slice();
+			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(CommandHeader.length())).slice();
 		}
 		
-		int length()
+		static int length()
 		{
-			return super.length() + 2;
+			return CommandHeader.length() + 2;
 		}
 
 		int dataLength()
@@ -491,12 +496,12 @@ final class Protocol
 		SendUnreliable(ByteBuffer buffer)
 		{
 			super(buffer);
-			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(super.length())).slice();
+			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(CommandHeader.length())).slice();
 		}
 
-		int length()
+		static int length()
 		{
-			return super.length() + 4;
+			return CommandHeader.length() + 4;
 		}
 		
 		int unreliableSequenceNumber()
@@ -527,12 +532,12 @@ final class Protocol
 		SendUnsequenced(ByteBuffer buffer)
 		{
 			super(buffer);
-			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(super.length())).slice();
+			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(CommandHeader.length())).slice();
 		}
 		
-		int length()
+		static int length()
 		{
-			return super.length() + 4;
+			return CommandHeader.length() + 4;
 		}
 
 		int unsequencedGroup()
@@ -563,7 +568,12 @@ final class Protocol
 		SendFragment(ByteBuffer buffer)
 		{
 			super(buffer);
-			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(super.length())).slice();
+			this.buffer = ((ByteBuffer) buffer.order(ByteOrder.BIG_ENDIAN).position(CommandHeader.length())).slice();
+		}
+		
+		static int length()
+		{
+		    return CommandHeader.length() + 20;
 		}
 
 		int startSequenceNumber()
