@@ -7,222 +7,320 @@ import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
+import java.util.ArrayList;
 import java.util.Map;
+import java.util.Properties;
+import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
+import java.util.prefs.Preferences;
+import java.util.prefs.PreferencesFactory;
+import java.util.zip.Checksum;
 
-import net.jenet.BandwidthLimit;
-import net.jenet.Header;
-import net.jenet.Peer;
+import com.memeo.enet.Peer.State;
 
 public class Host
 {
+    static final Preferences enetProperties;
+    
+    static
+    {
+        // TODO load properties file.
+        enetProperties = Preferences.userNodeForPackage(Host.class);
+    }
+    
+    public static final int DEFAULT_RECEIVE_BUFFER_SIZE = 256 * 1024;
+    public static final int DEFAULT_SEND_BUFFER_SIZE = 256 * 1024;
+    public static final int DEFAULT_MTU = 1400;
+    
+    public static final int MINIMUM_CHANNEL_COUNT = 1;
+    public static final int MAXIMUM_CHANNEL_COUNT = 255;
+    public static final int MAXIMUM_PEER_ID = 0xFFF;
+    
+    public static final int BANDWIDTH_THROTTLE_INTERVAL = 1000;
+    
     private InetSocketAddress address;
     private DatagramChannel channel;
     private Selector selector;
-    private Map<Short, Peer> peers;
-    private int maxConnections;
+    private ConcurrentMap<Short, Peer> peers;
+    private Queue<Protocol.Command> commands;
+    private int peerCount;
+    
     private int incomingBandwidth;
     private int outgoingBandwidth;
-    private Peer lastServicedPeer;
     private int bandwidthThrottleEpoch;
+    
+    private Peer lastServicedPeer;
     private boolean recalculateBandwidthLimits;
-    private short mtu;
-    private InetSocketAddress receivedAddress;
+    short mtu;
     private ByteBuffer buffers;
     private int bufferCount;
+    private int randomSeed;
+    private int channelLimit;
     
-    public Host(InetSocketAddress address, int maxConnections, int incomingBandwidth, int outgoingBandwidth)
+    private InetSocketAddress receivedAddress;
+    private ByteBuffer receivedBuffer;
+    
+    private long totalSentData;
+    private long totalSentPackets;
+    private long totalReceivedData;
+    private long totalReceivedPackets;
+
+    private Compressor compressor;
+    Checksum checksum;
+    Queue<Peer> dispatchQueue;
+    private int serviceTime;
+    
+    public Host(InetSocketAddress address, int peerCount, int channelLimit, int incomingBandwidth, int outgoingBandwidth)
         throws IOException
     {
         channel = DatagramChannel.open();
         channel.configureBlocking(false);
         channel.socket().bind(address);
+        channel.socket().setBroadcast(true);
+        channel.socket().setReceiveBufferSize(enetProperties.getInt("sockopt.recvbuf", DEFAULT_RECEIVE_BUFFER_SIZE));
+        channel.socket().setSendBufferSize(enetProperties.getInt("sockopt.sendbuf", DEFAULT_SEND_BUFFER_SIZE));
         selector = Selector.open();
         channel.register(selector, SelectionKey.OP_READ);
-        peers = new ConcurrentHashMap<Short, Peer>();
+        this.peerCount = Math.max(1, Math.min(peerCount, MAXIMUM_PEER_ID));
+        peers = new ConcurrentHashMap<Short, Peer>(this.peerCount);
+        commands = new ConcurrentLinkedQueue<Protocol.Command>();
         this.address = (InetSocketAddress) channel.socket().getLocalSocketAddress();
-        initHost(maxConnections, incomingBandwidth, outgoingBandwidth);
+        randomSeed = (int) System.currentTimeMillis();
+        randomSeed = (randomSeed << 16) | (randomSeed >> 16);
+        this.channelLimit = Math.max(MINIMUM_CHANNEL_COUNT, Math.min(MAXIMUM_CHANNEL_COUNT, channelLimit));
+        this.incomingBandwidth = Math.max(0, incomingBandwidth);
+        this.outgoingBandwidth = Math.max(0, outgoingBandwidth);
+        bandwidthThrottleEpoch = 0;
+        this.mtu = (short) enetProperties.getInt("enet.mtu", DEFAULT_MTU);
+        receivedAddress = new InetSocketAddress(0);
+        totalSentData = 0;
+        totalSentPackets = 0;
+        totalReceivedData = 0;
+        totalReceivedPackets = 0;
+        dispatchQueue = new ConcurrentLinkedQueue<Peer>();
     }
     
-    short assignPeerID( Peer peer ) {
-        for ( short peerID = 0; peerID < maxConnections; peerID++ )
-                if ( !peers.containsKey( peerID ) ) {
-                        peer.setIncomingPeerID( peerID );
-                        peers.put( peerID, peer );
-                        return peerID;
-                }
-        return -1;
+    public InetSocketAddress address()
+    {
+        return this.address;
     }
-
-    /**
-     * Adjusts the incoming/outgoing bandwidths for this host.
-     * 
-     * @see #Host
-     * @param incomingBandwidth
-     *            The maximum incoming bandwidth in bytes/secod (0 = unbounded).
-     * @param outgoingBandwidth
-     *            The maximum outgoing bandwidth in bytes/secod (0 = unbounded).
-     */
+    
     public void bandwidthLimit(int incomingBandwidth, int outgoingBandwidth)
     {
         this.incomingBandwidth = incomingBandwidth;
         this.outgoingBandwidth = outgoingBandwidth;
-        recalculateBandwidthLimits = true;
+        this.recalculateBandwidthLimits = true;
     }
-
-    void bandwidthThrottle()
+    
+    void bandwidthThrottle() throws EnetException
     {
-        int timeCurrent = getTime();
-        int elapsedTime = timeCurrent - bandwidthThrottleEpoch;
+        int timeCurrent = Time.get();
+        int elapsedTime = timeCurrent - this.bandwidthThrottleEpoch;
         int peersTotal = 0;
         int dataTotal = 0;
-        int peersRemaining = 0;
-        int bandwidth = 0;
+        int peersRemaining;
+        int bandwidth;
         int throttle = 0;
         int bandwidthLimit = 0;
-        boolean needsAdjustment = false;
-        Protocol.BandwidthLimit command = new Protocol.BandwidthLimit(null);
-
-        if ( elapsedTime < configuration.getInt( "ENET_HOST_BANDWIDTH_THROTTLE_INTERVAL" ) )
-                return;
-
-        for ( Peer peer : peers.values() )
-                if ( peer.isConnected() ) {
-                        ++peersTotal;
-                        dataTotal += peer.getOutgoingDataTotal();
-                }
-
-        if ( peersTotal == 0 )
-                return;
-
+        boolean needsAdjustment;
+        
+        if (elapsedTime < BANDWIDTH_THROTTLE_INTERVAL)
+            return;
+        
+        for (Peer peer : peers.values())
+        {
+            if (peer.state != Peer.State.CONNECTED && peer.state != Peer.State.DISCONNECT_LATER)
+                continue;
+            
+            peersTotal++;
+            dataTotal += peer.outgoingDataTotal;
+        }
+        
+        if (peersTotal == 0)
+            return;
+        
         peersRemaining = peersTotal;
         needsAdjustment = true;
-
-        if ( outgoingBandwidth == 0 )
-                bandwidth = 0;
+        
+        if (this.outgoingBandwidth == 0)
+            bandwidth = ~0;
         else
-                bandwidth = outgoingBandwidth * elapsedTime / 1000;
-
-        while ( peersRemaining > 0 && needsAdjustment ) {
-                needsAdjustment = false;
-                if ( dataTotal < bandwidth )
-                        throttle = bandwidth * configuration.getInt( "ENET_PEER_PACKET_THROTTLE_SCALE" ) / dataTotal;
-
-                for ( Peer peer : peers.values() ) {
-                        int peerBandwidth;
-
-                        if ( !peer.isConnected() || peer.getIncomingBandwidth() == 0
-                                        || peer.getOutgoingBandwidthThrottleEpoch() == timeCurrent )
-                                continue;
-
-                        peerBandwidth = peer.getIncomingBandwidth() * elapsedTime / 1000;
-
-                        if ( throttle * peer.getOutgoingDataTotal()
-                                        / configuration.getInt( "ENET_PEER_PACKET_THROTTLE_SCALE" ) >= peerBandwidth )
-                                continue;
-
-                        peer.setPacketThrottleLimit( peerBandwidth
-                                        * configuration.getInt( "ENET_PEER_PACKET_THROTTLE_SCALE" )
-                                        / peer.getOutgoingDataTotal() );
-
-                        if ( peer.getPacketThrottleLimit() == 0 )
-                                peer.setPacketThrottleLimit( 1 );
-
-                        if ( peer.getPacketThrottle() > peer.getPacketThrottleLimit() )
-                                peer.setPacketThrottle( peer.getPacketThrottleLimit() );
-
-                        peer.setOutgoingBandwidthThrottleEpoch( timeCurrent );
-
-                        needsAdjustment = true;
-
-                        --peersRemaining;
-
-                        bandwidth -= peerBandwidth;
-                        dataTotal -= peerBandwidth;
-                }
-        }
-
-        if ( peersRemaining > 0 ) {
-                for ( Peer peer : peers.values() ) {
-                        if ( !peer.isConnected() || peer.getOutgoingBandwidthThrottleEpoch() == timeCurrent )
-                                continue;
-
-                        peer.setPacketThrottleLimit( throttle );
-
-                        if ( peer.getPacketThrottle() > peer.getPacketThrottleLimit() )
-                                peer.setPacketThrottle( peer.getPacketThrottleLimit() );
-                }
-        }
-
-        if ( recalculateBandwithLimits ) {
-                recalculateBandwithLimits = false;
-
-                peersRemaining = peersTotal;
-
-                bandwidth = incomingBandwidth;
+            bandwidth = (this.outgoingBandwidth * elapsedTime) / 1000;
+        
+        while (peersRemaining > 0 && needsAdjustment)
+        {
+            needsAdjustment = false;
+            
+            if (dataTotal < bandwidth)
+                throttle = Peer.PACKET_THROTTLE_SCALE;
+            else
+                throttle = (bandwidth * Peer.PACKET_THROTTLE_SCALE) / dataTotal;
+            
+            for (Peer peer : this.peers.values())
+            {
+                int peerBandwidth;
+                
+                if ((peer.state != Peer.State.CONNECTED && peer.state != Peer.State.DISCONNECT_LATER)
+                    || peer.incomingBandwidth == 0
+                    || peer.outgoingBandwidthThrottleEpoch == timeCurrent)
+                    continue;
+                peerBandwidth = (peer.incomingBandwidth * elapsedTime) / 1000;
+                if ((throttle * peer.outgoingDataTotal) / Peer.PACKET_THROTTLE_SCALE <= peerBandwidth)
+                    continue;
+                peer.packetThrottleLimit = (peerBandwidth * Peer.PACKET_THROTTLE_SCALE) / peer.outgoingDataTotal;
+                if (peer.packetThrottleLimit == 0)
+                    peer.packetThrottleLimit = 1;
+                if (peer.packetThrottle > peer.packetThrottleLimit)
+                    peer.packetThrottle = peer.packetThrottleLimit;
+                peer.outgoingBandwidthThrottleEpoch = timeCurrent;
+                
                 needsAdjustment = true;
-
-                if ( bandwidth == 0 )
-                        bandwidthLimit = 0;
-                else
-                        while ( peersRemaining > 0 && needsAdjustment ) {
-                                for ( Peer peer : peers.values() ) {
-                                        if ( !peer.isConnected() || peer.getIncomingBandwidthThrottleEpoch() == timeCurrent )
-                                                continue;
-
-                                        if ( peer.getOutgoingBandwidth() > 0
-                                                        && bandwidthLimit > peer.getIncomingBandwidthThrottleEpoch() )
-                                                continue;
-
-                                        peer.setIncomingBandwidthThrottleEpoch( timeCurrent );
-
-                                        needsAdjustment = true;
-                                        --peersRemaining;
-                                        bandwidth -= peer.getOutgoingBandwidth();
-                                }
-                        }
-
-                for ( Peer peer : peers.values() ) {
-                        if ( !peer.isConnected() )
-                                continue;
-
-                        command.getHeader().setChannelID( (byte) 0xFF );
-                        command.getHeader().setFlags( Header.FLAG_ACKNOWLEDGE );
-                        command.setOutgoingBandwidth( outgoingBandwidth );
-
-                        if ( peer.getIncomingBandwidthThrottleEpoch() == timeCurrent )
-                                command.setIncomingBandwidth( peer.getOutgoingBandwidth() );
-                        else
-                                command.setIncomingBandwidth( bandwidthLimit );
-
-                        peer.queueOutgoingCommand( command, null, 0, (short) 0 );
-                }
+                peersRemaining--;
+                bandwidth -= peerBandwidth;
+                dataTotal -= peerBandwidth;
+            }
         }
-
-        bandwidthThrottleEpoch = timeCurrent;
-
-        for ( Peer peer : peers.values() ) {
-                peer.setIncomingDataTotal( 0 );
-                peer.setOutgoingDataTotal( 0 );
+        
+        if (peersRemaining > 0)
+        {
+            for (Peer peer : this.peers.values())
+            {
+                if ((peer.state != Peer.State.CONNECTED && peer.state != Peer.State.DISCONNECT_LATER)
+                    || peer.outgoingBandwidthThrottleEpoch == timeCurrent)
+                    continue;
+                peer.packetThrottleLimit = throttle;
+                if (peer.packetThrottle > peer.packetThrottleLimit)
+                    peer.packetThrottle = peer.packetThrottleLimit;
+            }
+        }
+        
+        if (this.recalculateBandwidthLimits)
+        {
+            this.recalculateBandwidthLimits = false;
+            
+            peersRemaining = peersTotal;
+            bandwidth = this.incomingBandwidth;
+            needsAdjustment = true;
+            
+            if (bandwidth == 0)
+                bandwidthLimit = 0;
+            else
+            {
+                while (peersRemaining > 0 && needsAdjustment)
+                {
+                    needsAdjustment = false;
+                    bandwidthLimit = bandwidth / peersRemaining;
+                    
+                    for (Peer peer : this.peers.values())
+                    {
+                        if ((peer.state != Peer.State.CONNECTED && peer.state != Peer.State.DISCONNECT_LATER)
+                            || peer.incomingBandwidthThrottleEpoch == timeCurrent)
+                            continue;
+                        
+                        if (peer.outgoingBandwidth > 0
+                            && peer.outgoingBandwidth >= bandwidthLimit)
+                            continue;
+                        
+                        peer.incomingBandwidthThrottleEpoch = timeCurrent;
+                        needsAdjustment = true;
+                        peersRemaining--;
+                        bandwidth -= peer.outgoingBandwidth;
+                    }
+                }
+                
+                for (Peer peer : this.peers.values())
+                {
+                    if (peer.state != Peer.State.CONNECTED && peer.state != Peer.State.DISCONNECT_LATER)
+                        continue;
+                    
+                    Protocol.BandwidthLimit command = new Protocol.BandwidthLimit();
+                    command.setCommand(Protocol.Command.BandwidthLimit);
+                    command.setChannelID(0xFF);
+                    command.setOutgoingBandwidth(this.outgoingBandwidth);
+                    if (peer.incomingBandwidthThrottleEpoch == timeCurrent)
+                        command.setIncomingBandwidth(peer.outgoingBandwidth);
+                    else
+                        command.setIncomingBandwidth(bandwidthLimit);
+                    peer.enqueueOutgoingCommand(command, null, 0, (short) 0);
+                }
+            }
+        }
+        
+        this.bandwidthThrottleEpoch = timeCurrent;
+        for (Peer peer : this.peers.values())
+        {
+            peer.incomingDataTotal = 0;
+            peer.outgoingDataTotal = 0;
         }
     }
-
-    void initHost( int maxConnections, int incomingBandwith, int outgoingBandwith )
+    
+    public void broadcast(int channelID, Packet packet)
+        throws IOException
     {
-        this.maxConnections = maxConnections;
-        this.incomingBandwidth = incomingBandwith;
-        this.outgoingBandwidth = outgoingBandwith;
-
-        lastServicedPeer = null;
-
-        peers = new ConcurrentHashMap<Short, Peer>();
-
-        bandwidthThrottleEpoch = 0;
-        recalculateBandwidthLimits = false;
-        mtu = 1400;
-        receivedAddress = new InetSocketAddress((InetAddress) null, 0);
-        buffers = ByteBuffer.allocateDirect( mtu );
-        buffers.clear();
-        bufferCount = 0;
+        for (Peer peer : peers.values())
+        {
+            if (peer.state != Peer.State.CONNECTED)
+                continue;
+            peer.send(channelID, packet);
+        }
+    }
+    
+    public void channelLimit(int channelLimit)
+    {
+        this.channelLimit = Math.max(MINIMUM_CHANNEL_COUNT, Math.min(MAXIMUM_CHANNEL_COUNT, channelLimit));
+    }
+    
+    public Peer connect(InetSocketAddress address, int channelCount, int data)
+        throws IOException
+    {
+        channelCount = Math.max(MINIMUM_CHANNEL_COUNT, Math.min(MAXIMUM_CHANNEL_COUNT, channelCount));
+        Peer peer = new Peer(this);
+        peer.channelCount = channelCount;
+        peer.state = State.CONNECTING;
+        peer.address = address;
+        peer.connectID = ++randomSeed;
+        short i;
+        do
+        {
+            if (peers.size() == peerCount)
+                throw new EnetException("maximum number of peers connected");
+            for (i = 0; peers.containsKey(Short.valueOf(i)); i++);
+            peer.incomingPeerID = i;
+        } while (peers.putIfAbsent(i, peer) != peer);
+        if (this.outgoingBandwidth == 0)
+            peer.windowSize = Protocol.MAXIMUM_WINDOW_SIZE;
+        else
+            peer.windowSize = (this.outgoingBandwidth / Peer.WINDOW_SIZE_SCALE) * Protocol.MAXIMUM_WINDOW_SIZE;
+        peer.windowSize = Math.max(Protocol.MINIMUM_WINDOW_SIZE, Math.max(Protocol.MAXIMUM_WINDOW_SIZE, peer.windowSize));
+        peer.channels = new ArrayList<Peer.Channel>(peer.channelCount);
+        Protocol.Connect connect = new Protocol.Connect();
+        connect.setCommand(Protocol.Command.Connect);
+        connect.setChannelID(0xFF);
+        connect.setOutgoingPeerID(peer.incomingPeerID);
+        connect.setOutgoingSessionID(0xFF);
+        connect.setIncomingSessionID(0xFF);
+        connect.setMtu(this.mtu);
+        connect.setWindowSize(peer.windowSize);
+        connect.setChannelCount(channelCount);
+        connect.setIncomingBandwidth(this.incomingBandwidth);
+        connect.setOutgoingBandwidth(this.outgoingBandwidth);
+        connect.setPacketThrottleInterval(peer.packetThrottleInterval);
+        connect.setPacketThrottleAcceleration(peer.packetThrottleAcceleration);
+        connect.setPacketThrottleDeceleration(peer.packetThrottleDeceleration);
+        peer.enqueueOutgoingCommand(connect, null, 0, (short) 0);
+        return peer;
+    }
+    
+    public void flush() throws IOException
+    {
+        this.serviceTime = Time.get();
+        this.sendOutgoingCommands(null, false);
+    }
+    
+    void sendOutgoingCommands(Event event, boolean checkForTimeouts) throws IOException
+    {
+        Protocol.Header header = new Protocol.Header();
     }
 }

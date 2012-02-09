@@ -2,6 +2,7 @@ package com.memeo.enet;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.EnumSet;
 
 /**
  * enet protocol handling.
@@ -10,23 +11,14 @@ import java.nio.ByteOrder;
  */
 final class Protocol
 {
-	static enum Constants
-	{
-		MinimumMTU              (576),
-		MaximumMTU             (4096),
-		MaximumPacketCommands    (32),
-		MinimumWindowSize      (4096),
-		MaximumWindowSize     (32768),
-		MinimumChannelCount       (1),
-		MaximumChannelCount     (255),
-		MaximumPeerID         (0xFFF);
-		
-		final int value;
-		Constants(int value)
-		{
-			this.value = value;
-		}
-	}
+    static final int MINIMUM_MTU = 576;
+    static final int MAXIMUM_MTU = 4096;
+    static final int MAXIMUM_PACKET_COMMANDS = 32;
+    static final int MINIMUM_WINDOW_SIZE = 4096;
+    static final int MAXIMUM_WINDOW_SIZE = 32768;
+    static final int MINIMUM_CHANNEL_COUNT = 1;
+    static final int MAXIMUM_CHANNEL_COUNT = 255;
+    static final int MAXIMUM_PEER_ID = 0xFFF;
 	
 	static enum Command
 	{
@@ -69,18 +61,91 @@ final class Protocol
 		}
 	}
 	
+	static enum CommandFlag
+	{
+	    Acknowledge (1 << 7),
+	    Unsequenced (1 << 6);
+	    
+	    final int value;
+	    private CommandFlag(int value)
+	    {
+	        this.value = value;
+	    }
+	    
+	    static int valueOf(EnumSet<CommandFlag> flags)
+	    {
+	        int value = 0;
+	        for (CommandFlag f : flags)
+	            value |= f.value;
+	        return value;
+	    }
+	    
+	    static EnumSet<CommandFlag> setOf(int value)
+	    {
+	        EnumSet<CommandFlag> flags = EnumSet.noneOf(CommandFlag.class);
+	        for (CommandFlag flag : EnumSet.allOf(CommandFlag.class))
+	        {
+	            if ((value & flag.value) != 0)
+	                flags.add(flag);
+	        }
+	        return flags;
+	    }
+	}
+	
+	static enum HeaderFlag
+	{
+	    Compressed (1 << 14),
+	    SentTime (1 << 15);
+	    
+	    final int value;
+	    
+	    private HeaderFlag(int value)
+	    {
+	        this.value = value;
+	    }
+        
+        static int valueOf(EnumSet<HeaderFlag> flags)
+        {
+            int value = 0;
+            for (HeaderFlag f : flags)
+                value |= f.value;
+            return value;
+        }
+        
+        static EnumSet<HeaderFlag> setOf(int value)
+        {
+            EnumSet<HeaderFlag> flags = EnumSet.noneOf(HeaderFlag.class);
+            for (HeaderFlag flag : EnumSet.allOf(HeaderFlag.class))
+            {
+                if ((value & flag.value) != 0)
+                    flags.add(flag);
+            }
+            return flags;
+        }
+	}
+	
 	static class Header
 	{
 		private final ByteBuffer buffer;
 		
+		Header()
+		{
+		    this.buffer = ByteBuffer.allocate(Header.length());
+		}
+		
 		Header(ByteBuffer buffer)
 		{
-			this.buffer = buffer.order(ByteOrder.BIG_ENDIAN);
+			this.buffer = buffer.slice().order(ByteOrder.BIG_ENDIAN);
 		}
 		
 		static int length()
 		{
 			return 4;
+		}
+		
+		ByteBuffer buffer()
+		{
+		    return buffer.slice();
 		}
 		
 		int peerID()
@@ -108,9 +173,14 @@ final class Protocol
 	{
 		private final ByteBuffer buffer;
 		
+		CommandHeader()
+		{
+		    this(ByteBuffer.allocate(CommandHeader.length()));
+		}
+		
 		public CommandHeader(ByteBuffer buffer)
 		{
-			this.buffer = buffer.order(ByteOrder.BIG_ENDIAN);
+			this.buffer = buffer.slice().order(ByteOrder.BIG_ENDIAN);
 		}
 		
 		static int length()
@@ -118,14 +188,24 @@ final class Protocol
 			return 4;
 		}
 		
+		ByteBuffer buffer()
+		{
+		    return buffer.slice();
+		}
+		
 		Command command() throws EnetException
 		{
-			return Command.forValue(buffer.get(0) & 0xFF);
+			return Command.forValue(buffer.get(0) & 0x0F);
 		}
 		
 		int channelID()
 		{
 			return buffer.get(1) & 0xFF;
+		}
+		
+		EnumSet<CommandFlag> flags()
+		{
+		    return CommandFlag.setOf(buffer.get(0) & 0xF0);
 		}
 		
 		int reliableSequenceNumber()
@@ -135,7 +215,16 @@ final class Protocol
 		
 		void setCommand(Command command)
 		{
-			buffer.put(0, command.value);
+		    byte value = buffer.get(0);
+		    value = (byte) ((value & ~0xF) | command.value);
+			buffer.put(0, value);
+		}
+		
+		void setFlags(EnumSet<CommandFlag> flags)
+		{
+		    byte value = buffer.get(0);
+		    value = (byte) ((value & 0xF) | CommandFlag.valueOf(flags));
+		    buffer.put(0, value);
 		}
 		
 		void setChannelID(int channelID)
@@ -152,6 +241,11 @@ final class Protocol
 	static class Acknowledge extends CommandHeader
 	{
 		private final ByteBuffer buffer;
+		
+		public Acknowledge()
+        {
+		    this(ByteBuffer.allocate(Acknowledge.length()));
+        }
 		
 		public Acknowledge(ByteBuffer buffer)
 		{
@@ -189,6 +283,11 @@ final class Protocol
 	{
 		private final ByteBuffer buffer;
 		
+		Connect()
+		{
+		    this(ByteBuffer.allocate(Connect.length()));
+		}
+		
 		Connect(ByteBuffer buffer)
 		{
 			super(buffer);
@@ -214,6 +313,11 @@ final class Protocol
 	static class VerifyConnect extends CommandHeader
 	{
 		private final ByteBuffer buffer;
+		
+		VerifyConnect()
+		{
+		    this(ByteBuffer.allocate(VerifyConnect.length()));
+		}
 		
 		VerifyConnect(ByteBuffer buffer)
 		{
@@ -351,6 +455,11 @@ final class Protocol
 	{
 		private final ByteBuffer buffer;
 		
+		BandwidthLimit()
+		{
+		    this(ByteBuffer.allocate(length()));
+		}
+		
 		BandwidthLimit(ByteBuffer buffer)
 		{
 			super(buffer);
@@ -386,6 +495,11 @@ final class Protocol
 	static class ThrottleConfigure extends CommandHeader
 	{
 		private final ByteBuffer buffer;
+		
+		ThrottleConfigure()
+        {
+		    this(ByteBuffer.allocate(length()));
+        }
 		
 		ThrottleConfigure(ByteBuffer buffer)
 		{
@@ -433,6 +547,11 @@ final class Protocol
 	{
 		private final ByteBuffer buffer;
 		
+		Disconnect()
+		{
+		    this(ByteBuffer.allocate(length()));
+		}
+		
 		Disconnect(ByteBuffer buffer)
 		{
 			super(buffer);
@@ -457,6 +576,11 @@ final class Protocol
 	
 	static class Ping extends CommandHeader
 	{
+	    Ping()
+	    {
+	        this(ByteBuffer.allocate(length()));
+	    }
+	    
 		Ping(ByteBuffer buffer)
 		{
 			super(buffer);
@@ -466,6 +590,11 @@ final class Protocol
 	static class SendReliable extends CommandHeader
 	{
 		private final ByteBuffer buffer;
+
+		SendReliable()
+		{
+		    this(ByteBuffer.allocate(length()));
+		}
 		
 		SendReliable(ByteBuffer buffer)
 		{
@@ -492,6 +621,11 @@ final class Protocol
 	static class SendUnreliable extends CommandHeader
 	{
 		private final ByteBuffer buffer;
+		
+		SendUnreliable()
+		{
+		    this(ByteBuffer.allocate(length()));
+		}
 		
 		SendUnreliable(ByteBuffer buffer)
 		{
@@ -529,6 +663,11 @@ final class Protocol
 	{
 		private final ByteBuffer buffer;
 		
+		SendUnsequenced()
+		{
+		    this(ByteBuffer.allocate(length()));
+		}
+		
 		SendUnsequenced(ByteBuffer buffer)
 		{
 			super(buffer);
@@ -564,6 +703,11 @@ final class Protocol
 	static class SendFragment extends CommandHeader
 	{
 		private final ByteBuffer buffer;
+		
+		SendFragment()
+		{
+		    this(ByteBuffer.allocate(length()));
+		}
 		
 		SendFragment(ByteBuffer buffer)
 		{
